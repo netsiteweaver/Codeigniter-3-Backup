@@ -1,5 +1,5 @@
 {
-  "name": "alihsaan/ci3-backup-tools",
+  "name": "netsiteweaver/codeigniter3-backup-tools",
   "description": "Backup and restore CLI tools for CodeIgniter 3 projects",
   "type": "library",
   "license": "MIT",
