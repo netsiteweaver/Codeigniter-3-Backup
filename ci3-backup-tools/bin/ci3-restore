@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   ci3-restore /absolute/path/to/ci3-backup_YYYY-mm-dd_HH-MM-SS.tar.gz [APP_DIR]
+ARCHIVE_PATH="${1:-}"
+APP_DIR="${2:-$(pwd)}"
+
+if [[ -z "${ARCHIVE_PATH}" ]]; then
+  echo "Usage: ci3-restore /absolute/path/to/ci3-backup_YYYY-mm-dd_HH-MM-SS.tar.gz [APP_DIR]"
+  exit 1
+fi
+
+APP_DIR="$(cd "${APP_DIR}" && pwd)"
+ENV_FILE="${ENV_FILE:-${APP_DIR}/.env}"
+TMP_ROOT="/tmp/ci3-restore"
+
+[[ "${ARCHIVE_PATH}" = /* ]] || { echo "Archive path must be absolute."; exit 1; }
+[[ -f "${ARCHIVE_PATH}" ]] || { echo "Archive not found: ${ARCHIVE_PATH}"; exit 1; }
+
+DB_HOST="${DB_HOST:-127.0.0.1}"
+DB_PORT="${DB_PORT:-3306}"
+DB_NAME="${DB_NAME:-}"
+DB_USER="${DB_USER:-}"
+DB_PASS="${DB_PASS:-}"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  while IFS='=' read -r raw_key raw_value; do
+    key="$(echo "${raw_key}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    value="$(echo "${raw_value:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "${key}" || "${key}" =~ ^# ]] && continue
+    value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+    case "${key}" in
+      DB_HOST) DB_HOST="${value}" ;;
+      DB_PORT) DB_PORT="${value}" ;;
+      DB_DATABASE) DB_NAME="${value}" ;;
+      DB_USERNAME) DB_USER="${value}" ;;
+      DB_PASSWORD) DB_PASS="${value}" ;;
+    esac
+  done < "${ENV_FILE}"
+fi
+
+if [[ -f "${ARCHIVE_PATH}.sha256" ]] && command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "${ARCHIVE_PATH}.sha256"
+fi
+
+STAMP_DIR="$(basename "${ARCHIVE_PATH}")"
+STAMP_DIR="${STAMP_DIR#ci3-backup_}"
+STAMP_DIR="${STAMP_DIR%.tar.gz}"
+RESTORE_DIR="${TMP_ROOT}/${STAMP_DIR}"
+
+mkdir -p "${TMP_ROOT}"
+rm -rf "${RESTORE_DIR}"
+tar -xzf "${ARCHIVE_PATH}" -C "${TMP_ROOT}"
+
+UPLOAD_ARCHIVE="${RESTORE_DIR}/app/uploads.tar.gz"
+DB_ARCHIVE="${RESTORE_DIR}/db/db.sql.gz"
+[[ -f "${UPLOAD_ARCHIVE}" ]] || { echo "uploads archive not found"; exit 1; }
+[[ -f "${DB_ARCHIVE}" ]] || { echo "db dump not found"; exit 1; }
+
+tar -xzf "${UPLOAD_ARCHIVE}" -C "${APP_DIR}"
+
+MYSQL_ARGS=(-h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" "${DB_NAME}")
+if [[ -n "${DB_PASS}" ]]; then
+  MYSQL_PWD="${DB_PASS}" gunzip -c "${DB_ARCHIVE}" | mysql "${MYSQL_ARGS[@]}"
+else
+  gunzip -c "${DB_ARCHIVE}" | mysql "${MYSQL_ARGS[@]}"
+fi
+
+echo "Restore completed."

@@ -1,0 +1,20 @@
+{
+  "name": "alihsaan/ci3-backup-tools",
+  "description": "Backup and restore CLI tools for CodeIgniter 3 projects",
+  "type": "library",
+  "license": "MIT",
+  "keywords": [
+    "codeigniter",
+    "codeigniter3",
+    "backup",
+    "restore",
+    "cron"
+  ],
+  "require": {
+    "php": ">=7.2"
+  },
+  "bin": [
+    "bin/ci3-backup",
+    "bin/ci3-restore"
+  ]
+}

@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   ci3-backup [APP_DIR]
+APP_DIR="${1:-$(pwd)}"
+APP_DIR="$(cd "${APP_DIR}" && pwd)"
+BACKUP_ROOT="${BACKUP_ROOT:-${APP_DIR}/backups}"
+RETENTION_DAYS="${RETENTION_DAYS:-14}"
+ENV_FILE="${ENV_FILE:-${APP_DIR}/.env}"
+
+DB_HOST="${DB_HOST:-127.0.0.1}"
+DB_PORT="${DB_PORT:-3306}"
+DB_NAME="${DB_NAME:-}"
+DB_USER="${DB_USER:-}"
+DB_PASS="${DB_PASS:-}"
+REMOTE_BACKUP_MODE="${REMOTE_BACKUP_MODE:-none}"     # none|rsync|ftp
+REMOTE_SSH_HOST="${REMOTE_SSH_HOST:-}"
+REMOTE_SSH_USER="${REMOTE_SSH_USER:-}"
+REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
+REMOTE_SSH_PATH="${REMOTE_SSH_PATH:-}"
+FTP_HOST="${FTP_HOST:-}"
+FTP_USER="${FTP_USER:-}"
+FTP_PASS="${FTP_PASS:-}"
+FTP_PORT="${FTP_PORT:-21}"
+FTP_PATH="${FTP_PATH:-/}"
+FTP_SSL="${FTP_SSL:-false}"
+REMOTE_KEEP_LOCAL="${REMOTE_KEEP_LOCAL:-true}"
+VERIFY_BACKUP="${VERIFY_BACKUP:-true}"
+REMOTE_RETENTION_ENABLED="${REMOTE_RETENTION_ENABLED:-false}"
+REMOTE_RETENTION_DAYS="${REMOTE_RETENTION_DAYS:-30}"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  while IFS='=' read -r raw_key raw_value; do
+    key="$(echo "${raw_key}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    value="$(echo "${raw_value:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "${key}" || "${key}" =~ ^# ]] && continue
+    value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+    case "${key}" in
+      DB_HOST) DB_HOST="${value}" ;;
+      DB_PORT) DB_PORT="${value}" ;;
+      DB_DATABASE) DB_NAME="${value}" ;;
+      DB_USERNAME) DB_USER="${value}" ;;
+      DB_PASSWORD) DB_PASS="${value}" ;;
+      REMOTE_BACKUP_MODE) REMOTE_BACKUP_MODE="${value}" ;;
+      REMOTE_SSH_HOST) REMOTE_SSH_HOST="${value}" ;;
+      REMOTE_SSH_USER) REMOTE_SSH_USER="${value}" ;;
+      REMOTE_SSH_PORT) REMOTE_SSH_PORT="${value}" ;;
+      REMOTE_SSH_PATH) REMOTE_SSH_PATH="${value}" ;;
+      FTP_HOST) FTP_HOST="${value}" ;;
+      FTP_USER) FTP_USER="${value}" ;;
+      FTP_PASS) FTP_PASS="${value}" ;;
+      FTP_PORT) FTP_PORT="${value}" ;;
+      FTP_PATH) FTP_PATH="${value}" ;;
+      FTP_SSL) FTP_SSL="${value}" ;;
+      REMOTE_KEEP_LOCAL) REMOTE_KEEP_LOCAL="${value}" ;;
+      VERIFY_BACKUP) VERIFY_BACKUP="${value}" ;;
+      REMOTE_RETENTION_ENABLED) REMOTE_RETENTION_ENABLED="${value}" ;;
+      REMOTE_RETENTION_DAYS) REMOTE_RETENTION_DAYS="${value}" ;;
+    esac
+  done < "${ENV_FILE}"
+fi
+
+TIMESTAMP="$(date +"%Y-%m-%d_%H-%M-%S")"
+WORK_DIR="${BACKUP_ROOT}/${TIMESTAMP}"
+APP_BACKUP_DIR="${WORK_DIR}/app"
+DB_BACKUP_DIR="${WORK_DIR}/db"
+LOG_PREFIX="[ci3-backup:${TIMESTAMP}]"
+
+echo "${LOG_PREFIX} Starting backup for ${APP_DIR}..."
+mkdir -p "${APP_BACKUP_DIR}" "${DB_BACKUP_DIR}"
+
+UPLOADS_DIR="${APP_DIR}/uploads"
+if [[ ! -d "${UPLOADS_DIR}" ]]; then
+  echo "${LOG_PREFIX} ERROR: Uploads directory not found: ${UPLOADS_DIR}"
+  exit 1
+fi
+tar -czf "${APP_BACKUP_DIR}/uploads.tar.gz" -C "${APP_DIR}" "uploads"
+
+if [[ -z "${DB_NAME}" || -z "${DB_USER}" ]]; then
+  echo "${LOG_PREFIX} ERROR: DB_DATABASE and DB_USERNAME are required."
+  exit 1
+fi
+MYSQL_ARGS=(--single-transaction --quick --routines --triggers --events -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}")
+if [[ -n "${DB_PASS}" ]]; then
+  MYSQL_PWD="${DB_PASS}" mysqldump "${MYSQL_ARGS[@]}" "${DB_NAME}" | gzip > "${DB_BACKUP_DIR}/db.sql.gz"
+else
+  mysqldump "${MYSQL_ARGS[@]}" "${DB_NAME}" | gzip > "${DB_BACKUP_DIR}/db.sql.gz"
+fi
+
+FINAL_ARCHIVE="${BACKUP_ROOT}/ci3-backup_${TIMESTAMP}.tar.gz"
+tar -czf "${FINAL_ARCHIVE}" -C "${BACKUP_ROOT}" "${TIMESTAMP}"
+rm -rf "${WORK_DIR}"
+echo "${LOG_PREFIX} Final archive: ${FINAL_ARCHIVE}"
+
+if [[ "${VERIFY_BACKUP}" == "true" ]]; then
+  tar -tzf "${FINAL_ARCHIVE}" >/dev/null
+  sha256sum "${FINAL_ARCHIVE}" > "${FINAL_ARCHIVE}.sha256"
+fi
+
+case "${REMOTE_BACKUP_MODE}" in
+  none|"") ;;
+  rsync)
+    ssh -p "${REMOTE_SSH_PORT}" "${REMOTE_SSH_USER}@${REMOTE_SSH_HOST}" "mkdir -p '${REMOTE_SSH_PATH}'"
+    rsync -az -e "ssh -p ${REMOTE_SSH_PORT}" "${FINAL_ARCHIVE}" "${REMOTE_SSH_USER}@${REMOTE_SSH_HOST}:${REMOTE_SSH_PATH}/"
+    [[ -f "${FINAL_ARCHIVE}.sha256" ]] && rsync -az -e "ssh -p ${REMOTE_SSH_PORT}" "${FINAL_ARCHIVE}.sha256" "${REMOTE_SSH_USER}@${REMOTE_SSH_HOST}:${REMOTE_SSH_PATH}/"
+    ;;
+  ftp)
+    FTP_SCHEME="ftp"; CURL_TLS_ARGS=()
+    [[ "${FTP_SSL}" == "true" ]] && FTP_SCHEME="ftps" && CURL_TLS_ARGS=(--ssl-reqd)
+    REMOTE_FILE_URL="${FTP_SCHEME}://${FTP_HOST}:${FTP_PORT}${FTP_PATH%/}/$(basename "${FINAL_ARCHIVE}")"
+    curl --fail --silent --show-error "${CURL_TLS_ARGS[@]}" --ftp-create-dirs -u "${FTP_USER}:${FTP_PASS}" -T "${FINAL_ARCHIVE}" "${REMOTE_FILE_URL}"
+    [[ -f "${FINAL_ARCHIVE}.sha256" ]] && curl --fail --silent --show-error "${CURL_TLS_ARGS[@]}" --ftp-create-dirs -u "${FTP_USER}:${FTP_PASS}" -T "${FINAL_ARCHIVE}.sha256" "${FTP_SCHEME}://${FTP_HOST}:${FTP_PORT}${FTP_PATH%/}/$(basename "${FINAL_ARCHIVE}.sha256")"
+    ;;
+  *) echo "${LOG_PREFIX} ERROR: Invalid REMOTE_BACKUP_MODE"; exit 1 ;;
+esac
+
+if [[ "${REMOTE_KEEP_LOCAL}" == "false" ]]; then
+  rm -f "${FINAL_ARCHIVE}" "${FINAL_ARCHIVE}.sha256"
+fi
+
+if [[ "${REMOTE_KEEP_LOCAL}" != "false" ]]; then
+  find "${BACKUP_ROOT}" -maxdepth 1 -type f -name "ci3-backup_*.tar.gz" -mtime +"${RETENTION_DAYS}" -delete
+  find "${BACKUP_ROOT}" -maxdepth 1 -type f -name "ci3-backup_*.tar.gz.sha256" -mtime +"${RETENTION_DAYS}" -delete
+fi
+
+echo "${LOG_PREFIX} Done."
